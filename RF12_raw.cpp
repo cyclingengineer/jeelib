@@ -2,7 +2,7 @@
 /// RFM12B driver implementation
 // 2009-02-09 <jc@wippler.nl> http://opensource.org/licenses/mit-license.php
 
-#include "RF12.h"
+#include "RF12_raw.h"
 #include <avr/io.h>
 #include <util/crc16.h>
 #include <avr/eeprom.h>
@@ -18,8 +18,8 @@
 // pin change interrupts are currently only supported on ATmega328's
 // #define PINCHG_IRQ 1    // uncomment this to use pin-change interrupts
 
-// maximum transmit / receive buffer: 3 header + data + 2 crc bytes
-#define RF_MAX   (RF12_MAXDATA + 5)
+// maximum transmit / receive buffer: data bytes
+#define RF_MAX   (RF12_MAXDATA)
 
 // pins used for the RFM12B interface - yes, there *is* logic in this madness:
 //
@@ -116,8 +116,7 @@
 
 // transceiver states, these determine what to do with each interrupt
 enum {
-    TXCRC1, TXCRC2, TXTAIL, TXDONE, TXIDLE,
-    TXRECV,
+    TXTAIL, TXDONE, TXIDLE,    
     TXPRE1, TXPRE2, TXPRE3, TXSYN1, TXSYN2,
 };
 
@@ -127,23 +126,12 @@ static uint8_t nodeid;              // address of this node
 static uint8_t group;               // network group
 static volatile uint8_t rxfill;     // number of data bytes in rf12_buf
 static volatile int8_t rxstate;     // current transceiver state
+static volatile uint8_t rf12_len;   // length of the data
 
 #define RETRIES     8               // stop retrying after 8 times
 #define RETRY_MS    1000            // resend packet every second until ack'ed
 
-static uint8_t ezInterval;          // number of seconds between transmits
-static uint8_t ezSendBuf[RF12_MAXDATA]; // data to send
-static char ezSendLen;              // number of bytes to send
-static uint8_t ezPending;           // remaining number of retries
-static long ezNextSend[2];          // when was last retry [0] or data [1] sent
-
-volatile uint16_t rf12_crc;         // running crc value
-volatile uint8_t rf12_buf[RF_MAX];  // recv/xmit buf, including hdr & crc bytes
-long rf12_seq;                      // seq number of encrypted packet (or -1)
-
-static uint32_t seqNum;             // encrypted send sequence number
-static uint32_t cryptKey[4];        // encryption key to use
-void (*crypter)(uint8_t);           // does en-/decryption (null if disabled)
+volatile uint8_t rf12_buf[RF_MAX];  // recv/xmit buf
 
 				    // function to set chip select pin from within sketch
 void rf12_set_cs(uint8_t pin)
@@ -291,36 +279,20 @@ static void rf12_interrupt() {
     // correction: now takes 2 + 8 µs, since sending can be done at 8 MHz
     rf12_xfer(0x0000);
     
-    if (rxstate == TXRECV) {
-        uint8_t in = rf12_xferSlow(RF_RX_FIFO_READ);
+    uint8_t out;
 
-        if (rxfill == 0 && group != 0)
-            rf12_buf[rxfill++] = group;
-            
-        rf12_buf[rxfill++] = in;
-        rf12_crc = _crc16_update(rf12_crc, in);
-
-        if (rxfill >= rf12_len + 5 || rxfill >= RF_MAX)
-            rf12_xfer(RF_IDLE_MODE);
-    } else {
-        uint8_t out;
-
-        if (rxstate < 0) {
-            uint8_t pos = 3 + rf12_len + rxstate++;
-            out = rf12_buf[pos];
-            rf12_crc = _crc16_update(rf12_crc, out);
-        } else
-            switch (rxstate++) {
-                case TXSYN1: out = 0x2D; break;
-                case TXSYN2: out = group; rxstate = - (2 + rf12_len); break;
-                case TXCRC1: out = rf12_crc; break;
-                case TXCRC2: out = rf12_crc >> 8; break;
-                case TXDONE: rf12_xfer(RF_IDLE_MODE); // fall through
-                default:     out = 0xAA;
-            }
-            
-        rf12_xfer(RF_TXREG_WRITE + out);
-    }
+    if (rxstate < 0) {
+        uint8_t pos = rf12_len + rxstate++;
+        out = rf12_buf[pos];
+    } else
+        switch (rxstate++) {
+            case TXSYN1: out = 0x2D; break;
+            case TXSYN2: out = group; rxstate = -rf12_len; break;
+            case TXDONE: rf12_xfer(RF_IDLE_MODE); // fall through
+            default:     out = 0xAA; //PRE1/2/3
+        }
+        
+    rf12_xfer(RF_TXREG_WRITE + out);
 }
 
 #if PINCHG_IRQ
@@ -342,66 +314,8 @@ static void rf12_interrupt() {
     #endif
 #endif
 
-static void rf12_recvStart () {
-    rxfill = rf12_len = 0;
-    rf12_crc = ~0;
-#if RF12_VERSION >= 2
-    if (group != 0)
-        rf12_crc = _crc16_update(~0, group);
-#endif
-    rxstate = TXRECV;    
-    rf12_xfer(RF_RECEIVER_ON);
-}
-
 #include <RF12.h> 
 #include <Ports.h> // needed to avoid a linker error :(
-
-byte rf12_recvDone();
-
-/// @details
-/// The timing of this function is relatively coarse, because SPI transfers are
-/// used to enable / disable the transmitter. This will add some jitter to the
-/// signal, probably in the order of 10 µsec.
-///
-/// If the result is true, then a packet has been received and is available for
-/// processing. The following global variables will be set:
-///
-/// * volatile byte rf12_hdr -
-///     Contains the header byte of the received packet - with flag bits and
-///     node ID of either the sender or the receiver.
-/// * volatile byte rf12_len -
-///     The number of data bytes in the packet. A value in the range 0 .. 66.
-/// * volatile byte rf12_data -
-///     A pointer to the received data.
-/// * volatile byte rf12_crc -
-///     CRC of the received packet, zero indicates correct reception. If != 0
-///     then rf12_hdr, rf12_len, and rf12_data should not be relied upon.
-///
-/// To send an acknowledgement, call rf12_sendStart() - but only right after
-/// rf12_recvDone() returns true. This is commonly done using these macros:
-///
-///     if(RF12_WANTS_ACK){
-///        rf12_sendStart(RF12_ACK_REPLY,0,0);
-///      }
-/// @see http://jeelabs.org/2010/12/11/rf12-acknowledgements/
-uint8_t rf12_recvDone () {
-    if (rxstate == TXRECV && (rxfill >= rf12_len + 5 || rxfill >= RF_MAX)) {
-        rxstate = TXIDLE;
-        if (rf12_len > RF12_MAXDATA)
-            rf12_crc = 1; // force bad crc if packet length is invalid
-        if (!(rf12_hdr & RF12_HDR_DST) || (nodeid & NODE_ID) == 31 ||
-                (rf12_hdr & RF12_HDR_MASK) == (nodeid & NODE_ID)) {
-            if (rf12_crc == 0 && crypter != 0)
-                crypter(0);
-            else
-                rf12_seq = -1;
-            return 1; // it's a broadcast packet or it's addressed to this node
-        }
-    }
-    if (rxstate == TXIDLE)
-        rf12_recvStart();
-    return 0;
-}
 
 /// @details
 /// Call this when you have some data to send. If it returns true, then you can
@@ -414,14 +328,10 @@ uint8_t rf12_recvDone () {
 /// should follow through and call rf12_sendStart() to actually initiate a send.
 /// See [this weblog post](http://jeelabs.org/2010/05/20/a-subtle-rf12-detail/).
 ///
-/// Note that even if you only want to send out packets, you still have to call
-/// rf12_recvDone() periodically, because it keeps the RFM12B logic going. If
-/// you don't, rf12_canSend() will never return true.
 uint8_t rf12_canSend () {
     // need interrupts off to avoid a race (and enable the RFM12B, thx Jorg!)
     // see http://openenergymonitor.org/emon/node/1051?page=3
-    if (rxstate == TXRECV && rxfill == 0 &&
-            (rf12_control(0x0000) & RF_RSSI_BIT) == 0) {
+    if ((rf12_control(0x0000) & RF_RSSI_BIT) == 0) { // make sure no-one else is Tx'ing
         rf12_control(RF_IDLE_MODE); // stop receiver
         rxstate = TXIDLE;
         return 1;
@@ -429,58 +339,28 @@ uint8_t rf12_canSend () {
     return 0;
 }
 
-void rf12_sendStart (uint8_t hdr) {
-    rf12_hdr = hdr & RF12_HDR_DST ? hdr :
-                (hdr & ~RF12_HDR_MASK) + (nodeid & NODE_ID);
-    if (crypter != 0)
-        crypter(1);
-    
-    rf12_crc = ~0;
-#if RF12_VERSION >= 2
-    rf12_crc = _crc16_update(rf12_crc, group);
-#endif
-    rxstate = TXPRE1;
-    rf12_xfer(RF_XMITTER_ON); // bytes will be fed via interrupts
-}
-
 /// @details
 /// Switch to transmission mode and send a packet.
-/// This can be either a request or a reply.
 ///
 /// Notes
 /// -----
 ///
-/// The rf12_sendStart() function may only be called in two specific situations:
+/// The rf12_sendStart() function may only be called in specific situations:
 ///
-/// * right after rf12_recvDone() returns true - used for sending replies / 
-///   acknowledgements
 /// * right after rf12_canSend() returns true - used to send requests out
 ///
 /// Because transmissions may only be started when there is no other reception
 /// or transmission taking place.
 ///
-/// The short form, i.e. "rf12_sendStart(hdr)" is for a special buffer-less
-/// transmit mode, as described in this
-/// [weblog post](http://jeelabs.org/2010/09/15/more-rf12-driver-notes/).
-///
-/// The call with 4 arguments, i.e. "rf12_sendStart(hdr, data, length, sync)" is
-/// deprecated, as described in that same weblog post. The recommended idiom is
-/// now to call it with 3 arguments, followed by a call to rf12_sendWait().
-/// @param hdr The header contains information about the destination of the
-///            packet to send, and flags such as whether this should be
-///            acknowledged - or if it actually is an acknowledgement.
+/// Call with 2 arguments, i.e. "rf12_sendStart(data, length)" 
+/// followed by a call to rf12_sendWait().
 /// @param ptr Pointer to the data to send as packet.
 /// @param len Number of data bytes to send. Must be in the range 0 .. 65.
-void rf12_sendStart (uint8_t hdr, const void* ptr, uint8_t len) {
+void rf12_sendStart (const void* ptr, uint8_t len) {
     rf12_len = len;
     memcpy((void*) rf12_data, ptr, len);
-    rf12_sendStart(hdr);
-}
-
-/// @deprecated Use the 3-arg version, followed by a call to rf12_sendWait.
-void rf12_sendStart (uint8_t hdr, const void* ptr, uint8_t len, uint8_t sync) {
-    rf12_sendStart(hdr, ptr, len);
-    rf12_sendWait(sync);
+    rxstate = TXPRE1;
+    rf12_xfer(RF_XMITTER_ON); // bytes will be fed via interrupts
 }
 
 /// @details
@@ -491,10 +371,9 @@ void rf12_sendStart (uint8_t hdr, const void* ptr, uint8_t len, uint8_t sync) {
 ///            acknowledged - or if it actually is an acknowledgement.
 /// @param ptr Pointer to the data to send as packet.
 /// @param len Number of data bytes to send. Must be in the range 0 .. 65.
-void rf12_sendNow (uint8_t hdr, const void* ptr, uint8_t len) {
-  while (!rf12_canSend())
-    rf12_recvDone(); // keep the driver state machine going, ignore incoming
-  rf12_sendStart(hdr, ptr, len);
+void rf12_sendNow (const void* ptr, uint8_t len) {
+  while (!rf12_canSend());
+  rf12_sendStart(ptr, len);
 }
   
 /// @details
@@ -509,7 +388,7 @@ void rf12_sendNow (uint8_t hdr, const void* ptr, uint8_t len) {
 void rf12_sendWait (uint8_t mode) {
     // wait for packet to actually finish sending
     // go into low power mode, as interrupts are going to come in very soon
-    while (rxstate != TXIDLE)
+    while (rxstate != TXDONE)
         if (mode) {
             // power down mode is only possible if the fuses are set to start
             // up in 258 clock cycles, i.e. approx 4 us - else must use standby!
@@ -673,7 +552,7 @@ uint8_t rf12_config (uint8_t show) {
         Serial.println();
     
     rf12_initialize(nodeId, nodeId >> 6, group);
-    return nodeId & RF12_HDR_MASK;
+    return nodeId & 0x1F; //RF12_HDR_MASK;
 }
 
 /// @details
@@ -708,197 +587,4 @@ void rf12_sleep (char n) {
 /// power still remaining will be sufficient to send or receive further packets.
 char rf12_lowbat () {
     return (rf12_control(0x0000) & RF_LBD_BIT) != 0;
-}
-
-/// @details
-/// Set up the easy transmission mechanism. The argument is the minimal number
-/// of seconds between new data packets (from 1 to 255). With 0 as argument,
-/// packets will be sent as fast as possible:
-///
-/// * On the 433 and 915 MHz frequency bands, this is fixed at 100 msec (10
-///   packets/second).
-/// 
-/// * On the 866 MHz band, the frequency depends on the number of bytes sent:
-///   for 1-byte packets, it will be up to 7 packets/second, for 66-byte bytes of
-///   data it will be around 1 packet/second.
-/// 
-/// This function should be called after the RF12 driver has been initialized,
-/// using either rf12_initialize() or rf12_config().
-/// @param secs The minimal number of seconds between new data packets (from 1 
-///             to 255). With a 0 argument, packets will be sent as fast as 
-///             possible: on the 433 and 915 MHz frequency bands, this is fixed 
-///             at 100 msec (10 packets/second). On 866 MHz, the frequency 
-///             depends on the number of bytes sent: for 1-byte packets, it will 
-///             be up to 7 packets/second, for 66-byte bytes of data it will be 
-///             approx. 1 packet/second.
-/// @note To be used in combination with rf12_easyPoll() and rf12_easySend().
-void rf12_easyInit (uint8_t secs) {
-    ezInterval = secs;
-}
-
-/// @details
-/// This needs to be called often to keep the easy transmission mechanism going, 
-/// i.e. once per millisecond or more in normal use. Failure to poll frequently 
-/// enough is relatively harmless but may lead to lost acknowledgements.
-/// @returns 1 = an ack has been received with actual data in it, use rf12len
-///          and rf12data to access it. 0 = there is nothing to do, the last 
-///          send has been ack'ed or more than 8 re-transmits have failed.
-///          -1 = still sending or waiting for an ack to come in
-/// @note To be used in combination with rf12_easyInit() and rf12_easySend().
-char rf12_easyPoll () {
-    if (rf12_recvDone() && rf12_crc == 0) {
-        byte myAddr = nodeid & RF12_HDR_MASK;
-        if (rf12_hdr == (RF12_HDR_CTL | RF12_HDR_DST | myAddr)) {
-            ezPending = 0;
-            ezNextSend[0] = 0; // flags succesful packet send
-            if (rf12_len > 0)
-                return 1;
-        }
-    }
-    if (ezPending > 0) {
-        // new data sends should not happen less than ezInterval seconds apart
-        // ... whereas retries should not happen less than RETRY_MS apart
-        byte newData = ezPending == RETRIES;
-        long now = millis();
-        if (now >= ezNextSend[newData] && rf12_canSend()) {
-            ezNextSend[0] = now + RETRY_MS;
-            // must send new data packets at least ezInterval seconds apart
-            // ezInterval == 0 is a special case:
-            //      for the 868 MHz band: enforce 1% max bandwidth constraint
-            //      for other bands: use 100 msec, i.e. max 10 packets/second
-            if (newData)
-                ezNextSend[1] = now +
-                    (ezInterval > 0 ? 1000L * ezInterval
-                                    : (nodeid >> 6) == RF12_868MHZ ?
-                                            13 * (ezSendLen + 10) : 100);
-            rf12_sendStart(RF12_HDR_ACK, ezSendBuf, ezSendLen);
-            --ezPending;
-        }
-    }
-    return ezPending ? -1 : 0;
-}
-
-/// @details
-/// Submit some data bytes to send using the easy transmission mechanism. The
-/// data bytes will be copied to an internal buffer since the actual send may
-/// take place later than specified, and may need to be re-transmitted in case
-/// packets are lost of damaged in transit.
-///
-/// Packets will be sent no faster than the rate specified in the
-/// rf12_easyInit() call, even if called more often.
-///
-/// Only packets which differ from the previous packet will actually be sent.
-/// To force re-transmission even if the data hasn't changed, call 
-/// "rf12_easySend(0,0)". This can be used to give a "sign of life" every once
-/// in a while, and to recover when the receiving node has been rebooted and no
-/// longer has the previous data.
-///
-/// The return value indicates whether a new packet transmission will be started
-/// (1), or the data is the same as before and no send is needed (0).
-///
-/// Note that you also have to call rf12_easyPoll periodically, because it keeps
-/// the RFM12B logic going. If you don't, rf12_easySend() will never send out
-/// any packets.
-/// @note To be used in combination with rf12_easyInit() and rf12_easyPoll().
-char rf12_easySend (const void* data, uint8_t size) {
-    if (data != 0 && size != 0) {
-        if (ezNextSend[0] == 0 && size == ezSendLen &&
-                                    memcmp(ezSendBuf, data, size) == 0)
-            return 0;
-        memcpy(ezSendBuf, data, size);
-        ezSendLen = size;
-    }
-    ezPending = RETRIES;
-    return 1;
-}
-
-// XXTEA by David Wheeler, adapted from http://en.wikipedia.org/wiki/XXTEA
-
-#define DELTA 0x9E3779B9
-#define MX (((z>>5^y<<2) + (y>>3^z<<4)) ^ ((sum^y) + \
-                                            (cryptKey[(uint8_t)((p&3)^e)] ^ z)))
-
-static void cryptFun (uint8_t send) {
-    uint32_t y, z, sum, *v = (uint32_t*) rf12_data;
-    uint8_t p, e, rounds = 6;
-    
-    if (send) {
-        // pad with 1..4-byte sequence number
-        *(uint32_t*)(rf12_data + rf12_len) = ++seqNum;
-        uint8_t pad = 3 - (rf12_len & 3);
-        rf12_len += pad;
-        rf12_data[rf12_len] &= 0x3F;
-        rf12_data[rf12_len] |= pad << 6;
-        ++rf12_len;
-        // actual encoding
-        char n = rf12_len / 4;
-        if (n > 1) {
-            sum = 0;
-            z = v[n-1];
-            do {
-                sum += DELTA;
-                e = (sum >> 2) & 3;
-                for (p=0; p<n-1; p++)
-                    y = v[p+1], z = v[p] += MX;
-                y = v[0];
-                z = v[n-1] += MX;
-            } while (--rounds);
-        }
-    } else if (rf12_crc == 0) {
-        // actual decoding
-        char n = rf12_len / 4;
-        if (n > 1) {
-            sum = rounds*DELTA;
-            y = v[0];
-            do {
-                e = (sum >> 2) & 3;
-                for (p=n-1; p>0; p--)
-                    z = v[p-1], y = v[p] -= MX;
-                z = v[n-1];
-                y = v[0] -= MX;
-            } while ((sum -= DELTA) != 0);
-        }
-        // strip sequence number from the end again
-        if (n > 0) {
-            uint8_t pad = rf12_data[--rf12_len] >> 6;
-            rf12_seq = rf12_data[rf12_len] & 0x3F;
-            while (pad-- > 0)
-                rf12_seq = (rf12_seq << 8) | rf12_data[--rf12_len];
-        }
-    }
-}
-
-/// @details
-/// This enables or disables encryption using the public domain XXTEA algorithm
-/// by David Wheeler. The payload will be extended with 1 .. 4 bytes, containing
-/// a 6..30-bit sequence number which is incremented in the sender for each new
-/// packet.
-///
-/// The number of bits sent across depends on the number of padding bytes needed
-/// to make the resulting payload an exact mulitple of 4 bytes. A longer
-/// sequence number field can provide more protection against replay attacks
-/// (note that verification of this sequence number must be implemented in the
-/// receiver code).
-///
-/// Encrypted packets (and acknowledgements) must be 4..62 bytes long. Packets
-/// less than 4 bytes will not be encrypted. On reception, the payload length is
-/// adjusted back to the original length passed to rf12_sendStart().
-///
-/// There is a "long rf12seq" global which is set to the received sequence
-/// number (only valid right after rf12recvDone() returns true). When encryption
-/// is not enabled, this global is set to -1.
-/// @param key Pointer to a 16-byte (128-bit) encryption key to use for all 
-///            packet data. A null pointer disables encryption again. Note: 
-///            this is an EEPROM address, not RAM! - RF12_EEPROM_EKEY is a great
-///            value to use, as defined in the include file, but another address
-///            can be specified if needed.
-/// @see http://jeelabs.org/2010/02/23/secure-transmissions/
-void rf12_encrypt (const uint8_t* key) {
-    // by using a pointer to cryptFun, we only link it in when actually used
-    if (key != 0) {
-        for (uint8_t i = 0; i < sizeof cryptKey; ++i)
-            ((uint8_t*) cryptKey)[i] = eeprom_read_byte(key + i);
-        crypter = cryptFun;
-    } else
-        crypter = 0;
 }
